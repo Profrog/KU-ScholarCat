@@ -1,0 +1,6 @@
+{
+  "name": "academic-paper-search",
+  "description": "OpenAlex 오픈 학술 API를 조회하여 반도체(HBM, EUV, 2nm), AI/LLM, 2차전지(전고체 배터리), 바이오, 통신(5G/6G) 등 첨단 산업별 최신 논문을 검색하고 실용화 가능성 및 산업 영향도(High/Medium/Low)를 분석한다.",
+  "profiles": ["academic", "research", "investment"],
+  "frontmatter": "name: academic-paper-search\ndescription: OpenAlex 오픈 학술 API를 조회하여 반도체, AI, 2차전지 등 첨단 산업별 최신 논문을 검색하고 산업 영향도를 분석한다.\nlicense: MIT\nmetadata:\n  category: research\n  locale: ko-KR\n  phase: v1"
+}

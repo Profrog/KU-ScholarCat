@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+uploads/*
+!uploads/.gitkeep
+.streamlit/credentials.toml
+cloudflared.exe
+*.log
+scratch/

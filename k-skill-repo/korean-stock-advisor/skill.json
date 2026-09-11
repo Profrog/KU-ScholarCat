@@ -1,0 +1,6 @@
+{
+  "name": "korean-stock-advisor",
+  "description": "네이버 증권 실시간 데이터로 국내 주요 주식(삼성전자, SK하이닉스, 현대차 등) 및 ETF의 실시간 시세, 외국인/기관 수급 동향, 증권사 컨센서스 목표주가, PER/PBR 밸류에이션 및 종합 투자 모멘텀 점수를 산출하여 브리핑한다.",
+  "profiles": ["finance", "stock", "investment"],
+  "frontmatter": "name: korean-stock-advisor\ndescription: 네이버 증권 실시간 시세, 외국인/기관 수급, 증권사 목표주가 및 밸류에이션 종합 분석\nlicense: MIT\nmetadata:\n  category: finance\n  locale: ko-KR\n  phase: v1"
+}

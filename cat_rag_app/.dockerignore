@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+uploads/*
+!uploads/.gitkeep
+.git
+.gitignore
+cloudflared.exe
+*.log
+scratch/
