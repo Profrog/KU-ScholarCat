@@ -478,14 +478,24 @@ def main():
         }
         search_q = sector_mapping.get(args.sector, args.sector)
     
-    # 1. 📚 고려대학교 도서관 공식 소장자료 (단행본/도서관 소장도서)
-    ku_books = search_ku_library_books(search_q, limit=args.n)
+    # 1~3. 고려대 도서관 3개 소스(소장자료 / EDS 해외저널 / dCollection)를
+    #       서로 독립적이므로 병렬로 조회하여 지연을 최소화한다.
+    from concurrent.futures import ThreadPoolExecutor
 
-    # 2. 🌐 고려대학교 도서관 공식 EDS 해외 학술논문 (교외접속 원문열람 oca.korea.ac.kr)
-    ku_eds_articles = search_ku_library_eds(search_q, limit=args.n)
+    def _safe(fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            print(f"[주의] 조회 예외: {e}", file=sys.stderr)
+            return []
 
-    # 3. 🎓 고려대학교 도서관 공식 KU 디지털 (dCollection 석·박사 학위논문)
-    ku_theses = search_ku_dcollection(search_q, direct_id=direct_id, limit=args.n)
+    with ThreadPoolExecutor(max_workers=3) as _ex:
+        _f_books = _ex.submit(_safe, search_ku_library_books, search_q, limit=args.n)
+        _f_eds = _ex.submit(_safe, search_ku_library_eds, search_q, limit=args.n)
+        _f_theses = _ex.submit(_safe, search_ku_dcollection, search_q, direct_id=direct_id, limit=args.n)
+        ku_books = _f_books.result()
+        ku_eds_articles = _f_eds.result()
+        ku_theses = _f_theses.result()
     
     output_data = {
         "status": "success",

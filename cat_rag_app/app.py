@@ -1,6 +1,14 @@
 import os
 import time
 import json
+
+# .env 파일 로드 (앱 디렉토리 기준). 실행 위치와 무관하게 키가 적용되도록 함.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
+
 import streamlit as st
 from rag_engine import CatRAGEngine, DEFAULT_API_KEY, DEFAULT_GEMINI_API_KEY, DEFAULT_DB_PATH
 from cat_widget import render_interactive_cat

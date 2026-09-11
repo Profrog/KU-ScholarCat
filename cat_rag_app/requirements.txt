@@ -1,8 +1,20 @@
 streamlit>=1.35.0
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-upstage>=0.1.0
-langchain-google-genai>=1.0.0
+langchain>=1.0.0
+langchain-core>=1.0.0
+langchain-google-genai>=2.0.0
 langchain-chroma>=0.1.0
 chromadb>=0.5.0
 python-dotenv>=1.0.0
+
+# K-Skill 크롤러 스크립트 공통 런타임 의존성
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+requests>=2.31.0
+openpyxl>=3.1.0
+
+# 특정 스킬 전용(선택): 필요할 때만 설치
+# playwright>=1.40.0        # foresttrip-vacancy (브라우저 자동화, playwright install 필요)
+# fast_flights>=2.0         # flight-ticket-search
+# popbill                    # popbill (세금계산서 SDK)
+# pypdf>=4.0                 # iros-registry-automation (PDF 파싱)
+# pdfplumber>=0.11          # iros-registry-automation (PDF 파싱)

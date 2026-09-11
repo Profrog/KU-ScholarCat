@@ -10,25 +10,34 @@ from typing import List, Generator, Tuple, Dict, Any, Optional
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
-from langchain_upstage import (
-    UpstageDocumentParseLoader,
-    UpstageEmbeddings,
-    ChatUpstage,
+from langchain_google_genai import (
+    ChatGoogleGenerativeAI,
+    GoogleGenerativeAIEmbeddings,
 )
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_chroma import Chroma
 
 import io
 
-# 콘솔 및 파이프라인 UTF-8 강제
+# 콘솔 UTF-8 인코딩 보정.
+# 주의: sys.stdout 객체를 새 TextIOWrapper 로 "교체"하면 Streamlit 등
+# 상위 런타임이 관리하는 스트림이 닫힐 때 'I/O operation on closed file'
+# 오류가 발생한다. 따라서 객체를 교체하지 않고 인코딩만 reconfigure 한다.
 try:
-    if hasattr(sys.stdout, 'buffer'):
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    if hasattr(sys.stderr, 'buffer'):
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+
+def _log(*args, **kwargs):
+    """진단용 로그 출력. Streamlit rerun 등으로 stdout이 닫혀
+    'I/O operation on closed file' 예외가 나더라도 조용히 무시한다."""
+    try:
+        print(*args, **kwargs)
+    except Exception:
+        pass
 
 # 기본 설정값
 DEFAULT_API_KEY = ""
@@ -36,45 +45,60 @@ DEFAULT_GEMINI_API_KEY = ""
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _K_SKILL_DB = os.path.join(_APP_DIR, "k_skill_db")
 DEFAULT_DB_PATH = _K_SKILL_DB
-K_SKILL_REPO_PATH = Path(r"c:\Users\rapad\OneDrive\Desktop\langgraph\k-skill-repo").resolve()
 
-# 파이썬 실행 바이너리
-RAG_PYTHON_EXE = os.path.expanduser(r"~\anaconda3\envs\rag_env\python.exe")
+
+def _resolve_k_skill_repo() -> Path:
+    """k-skill 레포 경로 해석: 환경변수 > 프로젝트 상위의 k-skill-repo > 기존 Windows 경로."""
+    env_path = os.getenv("K_SKILL_REPO_PATH")
+    if env_path and Path(env_path).exists():
+        return Path(env_path).resolve()
+    local_candidate = Path(_APP_DIR).parent / "k-skill-repo"
+    if local_candidate.exists():
+        return local_candidate.resolve()
+    return Path(r"c:\Users\rapad\OneDrive\Desktop\langgraph\k-skill-repo")
+
+
+K_SKILL_REPO_PATH = _resolve_k_skill_repo()
+
+# 파이썬 실행 바이너리: 환경변수 > 현재 인터프리터(가상환경) > Windows anaconda 경로
+RAG_PYTHON_EXE = os.getenv("RAG_PYTHON_EXE") or sys.executable
 if not os.path.exists(RAG_PYTHON_EXE):
-    RAG_PYTHON_EXE = sys.executable
+    _win_exe = os.path.expanduser(r"~\anaconda3\envs\rag_env\python.exe")
+    RAG_PYTHON_EXE = _win_exe if os.path.exists(_win_exe) else sys.executable
 
 
 class CatRAGEngine:
     """
-    Google Gemini & Upstage Solar 및 K-Skill 카탈로그 기반 온디맨드 에이전틱 RAG 엔진
+    Google Gemini 및 K-Skill 카탈로그 기반 온디맨드 에이전틱 RAG 엔진
     120+ 한국 특화 스킬을 VectorDB에서 실시간 라우팅하고,
     필요 시 온디맨드로 공공데이터 API 스크립트를 실행하여 최신 정보로 답변합니다.
     """
 
     def __init__(self, api_key: str = None, gemini_api_key: str = None, db_path: str = None):
-        self.api_key = api_key or os.getenv("UPSTAGE_API_KEY", DEFAULT_API_KEY)
+        # api_key 인자는 하위 호환용으로만 유지 (더 이상 사용하지 않음)
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY)
         self.db_path = db_path or os.getenv("CHROMA_DB_PATH", DEFAULT_DB_PATH)
 
-        # 1. 임베딩 모델 (Solar Embedding Large)
-        self.embeddings = UpstageEmbeddings(
-            api_key=self.api_key,
-            model="solar-embedding-1-large"
+        if not self.gemini_api_key:
+            raise ValueError(
+                "GEMINI_API_KEY 가 설정되지 않았습니다. .env 파일에 GEMINI_API_KEY 를 입력하세요."
+            )
+
+        # 1. 임베딩 모델 (Google Generative AI Embeddings)
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/gemini-embedding-001",
+            google_api_key=self.gemini_api_key,
         )
 
-        # 2. 분석 및 라우팅용 기본 LLM (Gemini Pro / Flash 빠른 라우팅 우선)
-        if self.gemini_api_key:
-            self.llm = ChatGoogleGenerativeAI(
-                model="gemini-3.6-flash",
-                google_api_key=self.gemini_api_key,
-                temperature=0.2
-            )
-        else:
-            self.llm = ChatUpstage(
-                api_key=self.api_key,
-                model="solar-pro",
-                temperature=0.2
-            )
+        # 2. 분석 및 라우팅용 경량 LLM (판단 작업은 빠른 flash-lite 사용)
+        #    문맥 분석/스킬 라우팅 같은 내부 판단은 속도가 중요하므로 경량 모델을 쓴다.
+        #    ROUTER_MODEL 환경변수로 오버라이드 가능.
+        router_model = os.getenv("ROUTER_MODEL", "gemini-flash-lite-latest")
+        self.llm = ChatGoogleGenerativeAI(
+            model=router_model,
+            google_api_key=self.gemini_api_key,
+            temperature=0.2
+        )
 
         # 3. Chroma VectorStore 연결
         self.vector_store = self._init_vector_store()
@@ -192,8 +216,9 @@ class CatRAGEngine:
      - **[3] 논문명**: ...
 
    ### 🎓 3. KU 디지털 (고려대학교 dCollection 학술 & 학위논문 - 3선)
-   - 엄선된 고려대 학위/학술논문 3편:
-     - **[1] 논문명**: [실제 논문명](실제_dcollection_url)
+   - ⚠️ 중요: [K-Skill 실시간 조회 데이터]의 "【고려대 dCollection 학위/학술논문】" 항목에 자료가 있으면 **반드시 그 개수만큼(최대 3편) 빠짐없이 출력**하세요. 데이터에 존재하는데 "0건"이나 "없음"으로 답하면 안 됩니다.
+   - 엄선된 고려대 학위/학술논문 (데이터에 있는 만큼):
+     - **[1] 논문명**: [실제 논문명](실제_dcollection_url)  ※ 링크(dcollection_url)가 데이터에 없을 때만 링크 없이 제목만 표기
        - **구분 / 학과**: 학위명(석사/박사/Article) | 학과/전공 | 저자/지도교수
        - **💡 논문 핵심 요약**: dCollection 초록 및 연구 성과 요약
        - **원문 열람**: [🎓 dCollection 상세페이지](실제_dcollection_url) | [📄 원문 바로보기(뷰어)](실제_viewer_url)
@@ -258,7 +283,7 @@ class CatRAGEngine:
             retriever = self.vector_store.as_retriever(search_kwargs={"k": k})
             return retriever.invoke(query)
         except Exception as e:
-            print(f"[ERROR] search_skills error: {e}")
+            _log(f"[ERROR] search_skills error: {e}")
             return []
 
     def execute_skill_script(self, skill_path: str, script_name: str, args: List[str], timeout: int = 40) -> Dict[str, Any]:
@@ -274,7 +299,7 @@ class CatRAGEngine:
             }
 
         cmd = [RAG_PYTHON_EXE, "-X", "utf8", str(script_full_path)] + args
-        print(f"🚀 [K-Skill 실행] {' '.join(cmd)}")
+        _log(f"🚀 [K-Skill 실행] {' '.join(cmd)}")
 
         try:
             proc = subprocess.run(
@@ -317,6 +342,69 @@ class CatRAGEngine:
                 "output": ""
             }
 
+    def format_papers_output(self, raw_output: str, max_per_category: int = 3) -> str:
+        """
+        academic-paper-search(run_papers.py)의 원본 JSON을 LLM이 놓치지 않도록
+        카테고리별(소장도서/해외저널/dCollection)로 정돈된 텍스트로 변환한다.
+        JSON 파싱에 실패하면 원본을 그대로 반환한다.
+        """
+        try:
+            data = json.loads(raw_output)
+        except Exception:
+            return raw_output  # JSON이 아니면 원본 유지
+
+        if not isinstance(data, dict):
+            return raw_output
+
+        lines: List[str] = []
+
+        # 1) 소장 단행본
+        books = data.get("ku_library_books") or []
+        lines.append(f"【고려대 도서관 소장자료 (단행본/도서) — {len(books)}건】")
+        if not books:
+            lines.append("  (검색 결과 없음)")
+        for i, b in enumerate(books[:max_per_category], 1):
+            lines.append(f"  {i}. 제목: {b.get('title','')}")
+            lines.append(f"     저자/출판: {b.get('author','')} | {b.get('publisher','')}")
+            lines.append(f"     구분/소장: {b.get('item_type','')} | {b.get('location','')}")
+            if b.get("library_url"):
+                lines.append(f"     링크: {b.get('library_url')}")
+
+        # 2) 해외 학술논문 (EDS / EzProxy)
+        eds = data.get("ku_eds_academic_papers") or []
+        lines.append("")
+        lines.append(f"【해외 학술논문 (EDS / 교외접속 EzProxy) — {len(eds)}건】")
+        if not eds:
+            lines.append("  (검색 결과 없음)")
+        for i, p in enumerate(eds[:max_per_category], 1):
+            lines.append(f"  {i}. 제목: {p.get('title','')}")
+            if p.get("main_ezproxy_url"):
+                lines.append(f"     교외접속 열람: {p.get('main_ezproxy_url')}")
+            for link in (p.get("full_text_links") or [])[:4]:
+                if link.get("url"):
+                    lines.append(f"     원문링크({link.get('name','link')}): {link.get('url')}")
+            if p.get("abstract"):
+                lines.append(f"     초록: {str(p.get('abstract'))[:400]}")
+
+        # 3) dCollection 학위/학술논문
+        dc = data.get("ku_dcollection_theses") or []
+        lines.append("")
+        lines.append(f"【고려대 dCollection 학위/학술논문 — {len(dc)}건】")
+        if not dc:
+            lines.append("  (검색 결과 없음)")
+        for i, t in enumerate(dc[:max_per_category], 1):
+            lines.append(f"  {i}. 제목: {t.get('title','')}")
+            lines.append(f"     저자/학과: {t.get('author','')} | {t.get('department','') or t.get('doc_type','')}")
+            lines.append(f"     발행: {t.get('publication_info','')}")
+            if t.get("dcollection_url"):
+                lines.append(f"     상세링크: {t.get('dcollection_url')}")
+            if t.get("viewer_url"):
+                lines.append(f"     원문뷰어: {t.get('viewer_url')}")
+            if t.get("abstract"):
+                lines.append(f"     초록: {str(t.get('abstract'))[:400]}")
+
+        return "\n".join(lines)
+
     def analyze_user_context(
         self,
         query: str,
@@ -356,7 +444,7 @@ class CatRAGEngine:
                     "user_query": query
                 })
             except Exception as e:
-                print(f"[주의] 문맥 분석 예외 (retry failed): {e}")
+                _log(f"[주의] 문맥 분석 예외 (retry failed): {e}")
                 core_match = re.search(r'\b(6G|5G|HBM|NWDAF|O-RAN|MIMO|AI|RF|RIS)\b', query, re.IGNORECASE)
                 pk = core_match.group(1).upper() if core_match else query[:20]
                 return {
@@ -381,7 +469,7 @@ class CatRAGEngine:
                     data["primary_keyword"] = core_match.group(1).upper()
             return data
         except Exception as e:
-            print(f"[주의] 문맥 분석 예외: {e}")
+            _log(f"[주의] 문맥 분석 예외: {e}")
             core_match = re.search(r'\b(6G|5G|HBM|NWDAF|O-RAN|MIMO|AI|RF|RIS)\b', query, re.IGNORECASE)
             pk = core_match.group(1).upper() if core_match else query[:20]
             return {
@@ -398,7 +486,7 @@ class CatRAGEngine:
         query: str,
         chat_history: List[Dict[str, str]] = None,
         k: int = 4,
-        model_name: str = "solar-pro",
+        model_name: str = "gemini-3.6-flash",
         temperature: float = 0.2
     ) -> Tuple[Generator[str, None, None], List[Document], Dict[str, Any]]:
         """
@@ -445,12 +533,28 @@ class CatRAGEngine:
         # 1. 유사 스킬 검색 (Top-K 후보 도구들 탐색)
         candidate_docs = self.search_skills(query, k=max(k, 4))
         prioritized_skill = None
-        if any(w in query_lower for w in ["논문", "학술", "paper", "arxiv", "openalex", "연구", "dcollection", "학위", "석사", "박사", "000000", "00000", "6g", "hbm"]):
+        if any(w in query_lower for w in ["논문", "학술", "paper", "arxiv", "openalex", "연구", "dcollection", "학위", "석사", "박사", "000000", "00000",
+                                          "6g", "5g", "4g", "lte", "ran", "o-ran", "통신", "무선", "네트워크", "반도체", "hbm", "기술"]):
             prioritized_skill = "academic-paper-search"
         elif any(w in query_lower for w in ["주식", "주가", "목표가", "수급", "외인", "기관", "코스피", "코스닥"]):
             prioritized_skill = "korean-stock-advisor"
         elif any(w in query_lower for w in ["창업", "지원사업", "지원금", "스타트업", "k-startup"]):
             prioritized_skill = "kstartup-search"
+
+        # [문맥 승계] prioritized_skill 이 확정되지 않은 짧은 후속 발화(정정/추가 요청 등)는
+        # 직전 어시스턴트 턴에서 사용한 스킬을 이어받는다. (예: "조금 부정확하다 통신쪽 ran이야!")
+        if not prioritized_skill and chat_history:
+            followup_signals = ["부정확", "아니", "말고", "그거 말고", "다시", "정확", "쪽이야", "쪽이", "말이야",
+                                "그게 아니", "틀렸", "이야", "이거", "그 논문", "추가", "더 ", "다른"]
+            is_short_followup = len(query.strip()) <= 40 or any(s in query for s in followup_signals)
+            if is_short_followup:
+                for prev_msg in reversed(chat_history):
+                    if prev_msg.get("role") == "assistant" and prev_msg.get("skill_info"):
+                        prev_skill = prev_msg["skill_info"].get("skill_detected")
+                        if prev_skill in ("academic-paper-search", "korean-stock-advisor", "kstartup-search"):
+                            prioritized_skill = prev_skill
+                            _log(f"🔗 [문맥 승계] 직전 턴 스킬 유지: {prioritized_skill}")
+                        break
 
         skill_docs = candidate_docs
         if prioritized_skill:
@@ -479,10 +583,46 @@ class CatRAGEngine:
                     except:
                         pass
 
+        # [실행 불가 스킬 폴백] 이 앱은 로컬 파이썬 스크립트를 실행해 데이터를 얻는다.
+        # 그런데 카탈로그의 절반 가량은 로컬 scripts 가 없는(프록시/런타임 전용) 스킬이라
+        # 실행하면 0건이 된다. prioritized_skill 이 없고 최상위 후보가 실행 불가라면,
+        # 고려대 도서관 통합검색(도서/논문/dCollection 모두 커버)인 academic-paper-search 로 폴백한다.
+        if not prioritized_skill and skill_docs:
+            top_meta = skill_docs[0].metadata
+            top_script = top_meta.get("primary_script", "")
+            top_path = top_meta.get("skill_path", "")
+            runnable = bool(top_script) and bool(top_path) and os.path.exists(
+                os.path.join(top_path, "scripts", top_script)
+            )
+            if not runnable:
+                _log(f"↩️ [폴백] 실행 불가 스킬({top_meta.get('skill_name')}) → academic-paper-search 로 전환")
+                prioritized_skill = "academic-paper-search"
+                paper_path = K_SKILL_REPO_PATH / "academic-paper-search"
+                matched = [d for d in candidate_docs if d.metadata.get("skill_name") == "academic-paper-search"]
+                if matched:
+                    skill_docs = matched + [d for d in candidate_docs if d not in matched]
+                elif paper_path.exists():
+                    try:
+                        with open(paper_path / "instruction.md", "r", encoding="utf-8") as f:
+                            inst = f.read()
+                        sfiles = [p.name for p in (paper_path / "scripts").glob("*.py")]
+                        forced_doc = Document(
+                            page_content=inst[:3000],
+                            metadata={
+                                "skill_name": "academic-paper-search",
+                                "has_scripts": len(sfiles) > 0,
+                                "primary_script": "run_papers.py",
+                                "skill_path": str(paper_path)
+                            }
+                        )
+                        skill_docs = [forced_doc] + candidate_docs
+                    except Exception:
+                        pass
+
         # 2단계: 사용자 문맥 분석 및 다층 키워드 추출 (후보 스킬 리스트 함께 전달)
         context_analysis = self.analyze_user_context(query, chat_history, candidate_skills=skill_docs[:4])
         search_target_q = context_analysis.get("primary_keyword") or query
-        print(f"🔍 [1단계 문맥 분석] {context_analysis}")
+        _log(f"🔍 [1단계 문맥 분석] {context_analysis}")
 
         skill_execution_info = {
             "skill_detected": None,
@@ -508,23 +648,30 @@ class CatRAGEngine:
 
             if primary_script and os.path.exists(skill_path):
                 try:
-                    router_chain = self.skill_router_prompt | self.llm | StrOutputParser()
-                    decision_str = router_chain.invoke({
-                        "script_path": f"scripts/{primary_script}",
-                        "skill_name": skill_name,
-                        "skill_guide": top_skill.page_content[:2000],
-                        "user_query": f"{query} (추출 핵심어: {search_target_q})"
-                    }).strip()
+                    # [성능 최적화] 규칙 기반 prioritized_skill이 이미 확정된 경우
+                    # 스킬 라우터 LLM 호출을 생략한다. (이 경로에서는 어차피 아래 로직이
+                    # should_run 을 강제로 True 로 덮어쓰므로 결과가 동일하다.)
+                    if prioritized_skill:
+                        should_run = True
+                        _log(f"⚡ [라우터 스킵] 규칙 기반 스킬 확정: {prioritized_skill} (LLM 라우터 호출 생략)")
+                    else:
+                        router_chain = self.skill_router_prompt | self.llm | StrOutputParser()
+                        decision_str = router_chain.invoke({
+                            "script_path": f"scripts/{primary_script}",
+                            "skill_name": skill_name,
+                            "skill_guide": top_skill.page_content[:2000],
+                            "user_query": f"{query} (추출 핵심어: {search_target_q})"
+                        }).strip()
 
-                    if "```json" in decision_str:
-                        decision_str = decision_str.split("```json")[1].split("```")[0].strip()
-                    elif "```" in decision_str:
-                        decision_str = decision_str.split("```")[1].split("```")[0].strip()
+                        if "```json" in decision_str:
+                            decision_str = decision_str.split("```json")[1].split("```")[0].strip()
+                        elif "```" in decision_str:
+                            decision_str = decision_str.split("```")[1].split("```")[0].strip()
 
-                    decision = json.loads(decision_str)
-                    print(f"🤖 [스킬 라우터 판단] {decision}")
+                        decision = json.loads(decision_str)
+                        _log(f"🤖 [스킬 라우터 판단] {decision}")
+                        should_run = decision.get("should_execute", False)
 
-                    should_run = decision.get("should_execute", False)
                     # 2단계: 복합 질의 및 심층 연구(뉴스/공고/주식 ➡️ 핵심 기술 도메인 ➡️ 도서관 논문) 자동 멀티 체이닝
                     is_academic_query = (
                         skill_name == "academic-paper-search" or
@@ -538,7 +685,7 @@ class CatRAGEngine:
                     )
 
                     if is_stock_and_paper_query:
-                        print("⚡ [복합 체이닝] 실시간 주식 모멘텀 ➡️ 핵심 기술 도메인 ➡️ 도서관 논문 검색 연쇄 실행")
+                        _log("⚡ [복합 체이닝] 실시간 주식 모멘텀 ➡️ 핵심 기술 도메인 ➡️ 도서관 논문 검색 연쇄 실행")
                         stock_skill_path = str(K_SKILL_REPO_PATH / "korean-stock-advisor")
                         stock_res = self.execute_skill_script(
                             skill_path=stock_skill_path,
@@ -558,7 +705,7 @@ class CatRAGEngine:
                             script_name="run_papers.py",
                             args=["--query", paper_target_q, "--n", "4", "--json"]
                         )
-                        paper_text = paper_res.get("output", "")
+                        paper_text = self.format_papers_output(paper_res.get("output", ""))
 
                         skill_execution_info["executed"] = True
                         skill_execution_info["command"] = f"run_stock.py --leaders ➡️ run_papers.py --query '{paper_target_q}'"
@@ -571,7 +718,7 @@ class CatRAGEngine:
 
                     # 2) 기술/산업/실무 질의 시 최신 산업 뉴스/사업공고 ➡️ 핵심 기술 키워드 ➡️ 논문 체이닝
                     elif is_academic_query and any(w in query_lower for w in ["4g", "5g", "6g", "게이트웨이", "코어", "패킷", "통신", "에릭슨", "삼성", "검증", "보안", "인공지능", "ai", "스타트업", "사업"]):
-                        print("⚡ [심층 멀티 체이닝] 최신 산업 뉴스/공고 스캔 ➡️ 핵심 실무 아키텍처 ➡️ 도서관 학술 검색 연쇄 실행")
+                        _log("⚡ [심층 멀티 체이닝] 최신 산업 뉴스/공고 스캔 ➡️ 핵심 실무 아키텍처 ➡️ 도서관 학술 검색 연쇄 실행")
                         news_skill_path = str(K_SKILL_REPO_PATH / "naver-news-search")
                         
                         # 뉴스 검색어 결정 (실무 핵심어 위주)
@@ -604,7 +751,7 @@ class CatRAGEngine:
                             script_name="run_papers.py",
                             args=["--query", search_target_q, "--n", "5", "--json"]
                         )
-                        paper_text = paper_res.get("output", "")
+                        paper_text = self.format_papers_output(paper_res.get("output", ""))
 
                         skill_execution_info["executed"] = True
                         skill_execution_info["command"] = f"run_news.py -q '{news_search_q}' ➡️ run_papers.py -q '{search_target_q}'"
@@ -639,11 +786,15 @@ class CatRAGEngine:
                             skill_execution_info["error"] = exec_res.get("error")
 
                             if exec_res.get("success"):
-                                skill_output_text = exec_res.get("output", "")[:25000]
+                                _out = exec_res.get("output", "")
+                                if skill_name == "academic-paper-search":
+                                    skill_output_text = self.format_papers_output(_out)[:25000]
+                                else:
+                                    skill_output_text = _out[:25000]
                             else:
                                 skill_output_text = f"조회 실패 또는 오류: {exec_res.get('error')}"
                 except Exception as e:
-                    print(f"[주의] 스킬 라우팅/실행 중 예외: {e}")
+                    _log(f"[주의] 스킬 라우팅/실행 중 예외: {e}")
                     if prioritized_skill:
                         try:
                             exec_res = self.execute_skill_script(
@@ -652,7 +803,11 @@ class CatRAGEngine:
                                 args=["--query", search_target_q, "--n", "5", "--json"]
                             )
                             if exec_res.get("success"):
-                                skill_output_text = exec_res.get("output", "")[:25000]
+                                _out = exec_res.get("output", "")
+                                if prioritized_skill == "academic-paper-search" or skill_name == "academic-paper-search":
+                                    skill_output_text = self.format_papers_output(_out)[:25000]
+                                else:
+                                    skill_output_text = _out[:25000]
                                 skill_execution_info["executed"] = True
                                 skill_execution_info["success"] = True
                                 skill_execution_info["command"] = exec_res.get("command")
@@ -662,18 +817,12 @@ class CatRAGEngine:
                     skill_execution_info["error"] = str(e)
 
         # 3단계: 초록과 소개를 심층 검토하여 사용자 맞춤형 큐레이션 답변 스트리밍 생성
-        if model_name.startswith("gemini"):
-            llm_instance = ChatGoogleGenerativeAI(
-                model=model_name,
-                google_api_key=self.gemini_api_key,
-                temperature=temperature
-            )
-        else:
-            llm_instance = ChatUpstage(
-                api_key=self.api_key,
-                model=model_name,
-                temperature=temperature
-            )
+        answer_model = model_name if model_name.startswith("gemini") else "gemini-3.6-flash"
+        llm_instance = ChatGoogleGenerativeAI(
+            model=answer_model,
+            google_api_key=self.gemini_api_key,
+            temperature=temperature
+        )
 
         user_analysis_formatted = json.dumps(context_analysis, ensure_ascii=False, indent=2)
 
@@ -688,7 +837,7 @@ class CatRAGEngine:
                 "context": context_text
             }, stream=True)
         except Exception as e:
-            print(f"[주의] 최종 답변 생성 예외 (retry failed): {e}")
+            _log(f"[주의] 최종 답변 생성 예외 (retry failed): {e}")
             # Fallback to a simple static answer
             def simple_stream():
                 yield "죄송합니다, 답변을 생성하는 중에 문제가 발생했습니다. 다시 시도해 주세요."
@@ -709,7 +858,7 @@ class CatRAGEngine:
                     return chain.invoke(inputs)
             except Exception as exc:
                 attempt += 1
-                print(f"[재시도] LLM 호출 실패 ({attempt}/{retries}): {exc}")
+                _log(f"[재시도] LLM 호출 실패 ({attempt}/{retries}): {exc}")
                 if attempt >= retries:
                     raise
                 time.sleep(2 ** attempt)  # exponential backoff
