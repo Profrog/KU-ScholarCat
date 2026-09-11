@@ -85,7 +85,9 @@ def clean_search_query(query: str):
         "학위논문", "교내논문", "논문", "찾아줘", "검색해줘", "알려줘", "서칭",
         "검색", "쪽", "최신", "에 대한", "대한", "관련", "해줘", "있어", "있나요",
         "디지털 학술정보 유통시스템", "dcollection", "dCollection", "이런거", "저런거",
-        "보여줘", "부탁해", "추천해줘", "좀", "추천", "지금", "할때", "못찾는"
+        "보여줘", "부탁해", "추천해줘", "좀", "추천", "지금", "할때", "못찾는",
+        "책이", "책은", "책을", "책", "도서", "단행본", "있는지", "있음",
+        "같은", "비슷한", "이랑", "처럼", "이 있는데", "있는데", "찾아", "찾기",
     ]
     cleaned = query
     cleaned = re.sub(r'https?://[^\s]+', ' ', cleaned)
@@ -96,7 +98,14 @@ def clean_search_query(query: str):
         cleaned = re.sub(re.escape(sw), ' ', cleaned, flags=re.IGNORECASE)
     
     cleaned = re.sub(r'[\(\)\[\]\{\}\"\'\:\,\.\?\~\!\@\#\$\%\^\&\*\_\+\=]', ' ', cleaned)
-    cleaned = " ".join(cleaned.split())
+    # 중복 토큰 제거(순서 유지)
+    seen = set()
+    tokens = []
+    for tok in cleaned.split():
+        if tok not in seen:
+            seen.add(tok)
+            tokens.append(tok)
+    cleaned = " ".join(tokens)
     return found_id, cleaned
 
 def fetch_dcollection_detail(doc_id: str):

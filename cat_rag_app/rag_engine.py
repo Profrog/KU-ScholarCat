@@ -79,29 +79,37 @@ class CatRAGEngine:
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", DEFAULT_GEMINI_API_KEY)
         self.db_path = db_path or os.getenv("CHROMA_DB_PATH", DEFAULT_DB_PATH)
 
-        if not self.gemini_api_key:
+        # 로컬 Codex 백엔드 사용 시 Gemini 없이도 동작한다(개인용).
+        self._codex_backend = os.getenv("LLM_BACKEND", "").lower() == "codex"
+
+        if not self.gemini_api_key and not self._codex_backend:
             raise ValueError(
-                "GEMINI_API_KEY 가 설정되지 않았습니다. .env 파일에 GEMINI_API_KEY 를 입력하세요."
+                "GEMINI_API_KEY 가 설정되지 않았습니다. .env 파일에 GEMINI_API_KEY 를 입력하거나 "
+                "LLM_BACKEND=codex 로 로컬 백엔드를 사용하세요."
             )
 
-        # 1. 임베딩 모델 (Google Generative AI Embeddings)
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=self.gemini_api_key,
-        )
+        # 1~2. Gemini 임베딩/LLM: 키가 있을 때만 초기화 (없으면 None → 규칙/로컬 폴백)
+        self.embeddings = None
+        self.llm = None
+        if self.gemini_api_key:
+            try:
+                self.embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/gemini-embedding-001",
+                    google_api_key=self.gemini_api_key,
+                )
+                router_model = os.getenv("ROUTER_MODEL", "gemini-flash-lite-latest")
+                self.llm = ChatGoogleGenerativeAI(
+                    model=router_model,
+                    google_api_key=self.gemini_api_key,
+                    temperature=0.2
+                )
+            except Exception as e:
+                _log(f"[주의] Gemini 초기화 실패 (로컬 폴백으로 진행): {e}")
+                self.embeddings = None
+                self.llm = None
 
-        # 2. 분석 및 라우팅용 경량 LLM (판단 작업은 빠른 flash-lite 사용)
-        #    문맥 분석/스킬 라우팅 같은 내부 판단은 속도가 중요하므로 경량 모델을 쓴다.
-        #    ROUTER_MODEL 환경변수로 오버라이드 가능.
-        router_model = os.getenv("ROUTER_MODEL", "gemini-flash-lite-latest")
-        self.llm = ChatGoogleGenerativeAI(
-            model=router_model,
-            google_api_key=self.gemini_api_key,
-            temperature=0.2
-        )
-
-        # 3. Chroma VectorStore 연결
-        self.vector_store = self._init_vector_store()
+        # 3. Chroma VectorStore 연결 (임베딩이 있을 때만)
+        self.vector_store = self._init_vector_store() if self.embeddings else None
 
         # 4. 스킬 실행 판단 및 파라미터 생성 프롬프트
         self.skill_router_prompt = ChatPromptTemplate.from_messages([
@@ -279,6 +287,8 @@ class CatRAGEngine:
 
     def search_skills(self, query: str, k: int = 2) -> List[Document]:
         """사용자 질문과 가장 유사한 K-Skill 검색"""
+        if not self.vector_store:
+            return []
         try:
             retriever = self.vector_store.as_retriever(search_kwargs={"k": k})
             return retriever.invoke(query)
@@ -433,6 +443,22 @@ class CatRAGEngine:
                 f"- {d.metadata.get('skill_name')}: {d.page_content[:150].replace(chr(10), ' ')}"
                 for d in candidate_skills
             ])
+
+        # 키워드 추출(문맥분석)은 입력·출력이 짧아 비용이 극히 적으므로 Gemini 를 우선 사용한다.
+        # (답변 생성은 codex 가 담당 → 비싼 부분만 무료화)
+        # Gemini LLM 이 없거나(키 없음/초기화 실패) DISABLE_GEMINI 인 경우에만 규칙 기반으로 폴백한다.
+        if self.llm is None or os.getenv("DISABLE_GEMINI", "").lower() in ("1", "true"):
+            core_match = re.search(r'\b(6G|5G|4G|LTE|HBM|NWDAF|O-RAN|RAN|MIMO|AI|RF|RIS)\b', query, re.IGNORECASE)
+            pk = core_match.group(1).upper() if core_match else query.strip()[:25]
+            top_skill = candidate_skills[0].metadata.get("skill_name") if candidate_skills else "academic-paper-search"
+            return {
+                "referenced_skill": top_skill,
+                "skill_reference_reason": "규칙 기반 키워드 추출(Gemini 미사용)",
+                "primary_keyword": pk,
+                "sub_keywords": [],
+                "user_interest_summary": "사용자 질의 기반 검색",
+                "recommended_focus": "핵심 자료 큐레이션"
+            }
 
         try:
             # Use retry helper for context analysis LLM call
@@ -817,6 +843,29 @@ class CatRAGEngine:
                     skill_execution_info["error"] = str(e)
 
         # 3단계: 초록과 소개를 심층 검토하여 사용자 맞춤형 큐레이션 답변 스트리밍 생성
+        user_analysis_formatted = json.dumps(context_analysis, ensure_ascii=False, indent=2)
+        final_inputs = {
+            "question": query,
+            "user_analysis": user_analysis_formatted,
+            "skill_output": skill_output_text,
+            "context": context_text
+        }
+
+        # [백엔드 선택] LLM_BACKEND=codex 이면 로컬 Codex CLI 로 최종 답변을 생성한다.
+        # (개인용: Gemini 크레딧 미사용) 실패 시 Gemini 로 폴백한다.
+        if os.getenv("LLM_BACKEND", "").lower() == "codex":
+            try:
+                import codex_backend
+                if codex_backend.is_available():
+                    prompt_text = self.final_answer_prompt.format(**final_inputs)
+                    _log("🧩 [백엔드] Codex CLI 로 최종 답변 생성")
+                    stream = codex_backend.stream_codex(prompt_text)
+                    return stream, skill_docs, skill_execution_info
+                else:
+                    _log("[주의] LLM_BACKEND=codex 이나 codex 실행 파일을 찾지 못함 → Gemini 폴백")
+            except Exception as e:
+                _log(f"[주의] Codex 백엔드 실패 → Gemini 폴백: {e}")
+
         answer_model = model_name if model_name.startswith("gemini") else "gemini-3.6-flash"
         llm_instance = ChatGoogleGenerativeAI(
             model=answer_model,
@@ -824,18 +873,11 @@ class CatRAGEngine:
             temperature=temperature
         )
 
-        user_analysis_formatted = json.dumps(context_analysis, ensure_ascii=False, indent=2)
-
         # Use retry helper for final answer generation LLM call
         chain = self.final_answer_prompt | llm_instance | StrOutputParser()
         try:
             # Attempt to get the streaming generator with retries
-            stream = self._invoke_with_retry(chain, {
-                "question": query,
-                "user_analysis": user_analysis_formatted,
-                "skill_output": skill_output_text,
-                "context": context_text
-            }, stream=True)
+            stream = self._invoke_with_retry(chain, final_inputs, stream=True)
         except Exception as e:
             _log(f"[주의] 최종 답변 생성 예외 (retry failed): {e}")
             # Fallback to a simple static answer
@@ -845,10 +887,14 @@ class CatRAGEngine:
 
         return stream, skill_docs, skill_execution_info
 
-    def _invoke_with_retry(self, chain, inputs: dict, retries: int = 3, stream: bool = False):
+    def _invoke_with_retry(self, chain, inputs: dict, retries: int = None, stream: bool = False):
         """Helper to invoke a LangChain chain with retry logic.
         If `stream` is True, returns a generator stream; otherwise returns the full result.
+        재시도 횟수는 LLM_RETRIES 환경변수로 조정(기본 1회 시도, 재시도 없음).
+        429(RESOURCE_EXHAUSTED)는 재시도해도 무의미하므로 즉시 중단한다.
         """
+        if retries is None:
+            retries = int(os.getenv("LLM_RETRIES", "1"))
         attempt = 0
         while attempt < retries:
             try:
@@ -857,6 +903,11 @@ class CatRAGEngine:
                 else:
                     return chain.invoke(inputs)
             except Exception as exc:
+                msg = str(exc)
+                # 쿼터/크레딧 소진은 재시도 무의미 → 즉시 중단
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    _log(f"[중단] 쿼터/크레딧 소진(429), 재시도 생략: {msg[:100]}")
+                    raise
                 attempt += 1
                 _log(f"[재시도] LLM 호출 실패 ({attempt}/{retries}): {exc}")
                 if attempt >= retries:
